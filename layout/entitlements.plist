@@ -16,11 +16,5 @@
 	<array>
 		<string>$(AppIdentifierPrefix)com.apple.F1X3R</string>
 	</array>
-
-	<key>com.apple.private.security.no-sandbox</key>
-	<true/>
-
-	<key>com.apple.private.persona-mgmt</key>
-	<true/>
 </dict>
 </plist>
