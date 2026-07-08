@@ -1,0 +1,117 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # เลือกใช้เวอร์ชันตามที่คุณทดสอบแล้วว่ารันได้ทันที
+    runs-on: macos-26
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: install dependencies
+        run: brew install ldid xz
+
+      - name: setup theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git /Users/runner/theos
+          echo "THEOS=/Users/runner/theos" >> $GITHUB_ENV
+
+      - name: download ios sdk
+        run: |
+          mkdir -p /Users/runner/theos/sdks
+          # ดึง SDK ตรงจาก Xcode บนเครื่องเพื่อแก้ปัญหาไฟล์ตระกูล tar.xz พัง
+          ln -s /Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk /Users/runner/theos/sdks/iPhoneOS16.5.sdk
+
+      - name: build package
+        run: |
+          make clean
+          make package
+        env:
+          THEOS: /Users/runner/theos
+
+      - name: prepare build directory
+        run: |
+          mkdir -p build
+          # ดึงไฟล์ .ipa จากโฟลเดอร์ packages ของ Theos ไปรออัปโหลดเข้า Release
+          cp packages/*.ipa build/app.ipa
+
+      - name: upload artifact (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-ipa
+          path: build/app.ipa
+
+      - name: upload release ipa
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-ipa
+          path: build/app.ipa
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: download ipa
+        uses: actions/download-artifact@v4
+        with:
+          name: release-ipa
+          path: build/
+
+      - name: get last 12h commits
+        run: |
+          COMMITS=$(git log --since="12 hours ago" --pretty=format:"- %h %s (%an)")
+          if [ -z "$COMMITS" ]; then
+            COMMITS="no commits in the last 12 hours"
+          fi
+          echo "COMMITS<<EOF" >> $GITHUB_ENV
+          echo "$COMMITS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: write release notes
+        run: |
+          cat <<EOF > release_notes.txt
+          app nightly build
+          
+          Last 12 hours commits:
+          
+          ${COMMITS}
+          EOF
+
+      - name: update nightly release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view nightly >/dev/null 2>&1 || \
+          gh release create nightly \
+            --title "Nightly" \
+            --notes "initial nightly" \
+            --prerelease
+      
+          gh release edit nightly \
+            --title "Nightly Build" \
+            --notes-file release_notes.txt \
+            --prerelease
+      
+          gh release upload nightly build/app.ipa --clobber
