@@ -1,12 +1,14 @@
 #import "RootViewController.h"
 #import <dlfcn.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
-#import <sys/stat.h>    // สำหรับใช้คำสั่ง chmod ปรับสิทธิ์ไฟล์
+#import <sys/stat.h>
+#import <mach-o/loader.h>
+#import <mach-o/fat.h>
 
 @interface RootViewController () <UITableViewDelegate, UITableViewDataSource, UIDocumentPickerDelegate>
 
 @property (nonatomic, strong) UITableView *tableView;
-@property (nonatomic, strong) NSMutableArray *historyItems; // เก็บลายชื่อไฟล์ที่เคยฉีดไว้เทส
+@property (nonatomic, strong) NSMutableArray *historyItems;
 
 @end
 
@@ -27,7 +29,7 @@
 - (void)viewDidLoad {
     [super viewDidLoad];
     
-    // ตั้งค่าพื้นหลังดาร์กโทน สไตล์ Liquid Glass Dark Theme
+    // UI สไตล์ Custom Dark Theme
     self.view.backgroundColor = [UIColor colorWithRed:0.07 green:0.07 blue:0.08 alpha:1.0];
     
     if (self.navigationController) {
@@ -43,7 +45,6 @@
 #pragma mark - UI Setup
 
 - (void)setupHeaderView {
-    // ส่วนหัวของแอปสไตล์ Dark Mode
     UIView *headerContainer = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 140)];
     headerContainer.backgroundColor = [UIColor colorWithRed:0.10 green:0.10 blue:0.12 alpha:1.0];
     
@@ -54,7 +55,7 @@
     [headerContainer addSubview:titleLabel];
     
     UILabel *subTitleLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 95, self.view.bounds.size.width - 40, 20)];
-    subTitleLabel.text = @"เลือกไฟล์ .dylib หรือ .framework เพื่อทดสอบ";
+    subTitleLabel.text = @"เลือก .dylib / .framework เพื่อฉีดเข้าแอปตัวเอง";
     subTitleLabel.textColor = [UIColor lightGrayColor];
     subTitleLabel.font = [UIFont systemFontOfSize:14];
     [headerContainer addSubview:subTitleLabel];
@@ -63,7 +64,6 @@
 }
 
 - (void)setupTableView {
-    // สร้างตารางในสไตล์ Dark Custom Tables
     CGFloat topOffset = 140.0;
     self.tableView = [[UITableView alloc] initWithFrame:CGRectMake(0, topOffset, self.view.bounds.size.width, self.view.bounds.size.height - topOffset) style:UITableViewStyleGrouped];
     self.tableView.delegate = self;
@@ -77,7 +77,7 @@
 #pragma mark - UITableView DataSource & Delegate
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return 2; // Section 0: ปุ่มเลือกไฟล์หลัก, Section 1: ประวัติการฉีดทดสอบ
+    return 2; 
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -102,7 +102,6 @@
         cell.textLabel.textColor = [UIColor whiteColor];
         cell.detailTextLabel.textColor = [UIColor lightGrayColor];
         
-        // Custom Selection Color (เวลาคลิกให้เป็นสีเทาเข้ม)
         UIView *bgColorView = [[UIView alloc] init];
         bgColorView.backgroundColor = [UIColor colorWithRed:0.20 green:0.20 blue:0.22 alpha:1.0];
         [cell setSelectedBackgroundView:bgColorView];
@@ -111,8 +110,8 @@
     if (indexPath.section == 0) {
         cell.textLabel.text = @"➕ เลือกและฉีดไฟล์ใหม่ (File Picker)";
         cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-        cell.textLabel.textColor = [UIColor colorWithRed:0.22 green:0.65 blue:1.00 alpha:1.0]; // สีฟ้าเรืองแสง
-        cell.detailTextLabel.text = @"รองรับไฟล์ .dylib และ .framework จากแอปไฟล์";
+        cell.textLabel.textColor = [UIColor colorWithRed:0.22 green:0.65 blue:1.00 alpha:1.0];
+        cell.detailTextLabel.text = @"ดึงไฟล์ .dylib หรือ .framework เข้ามาทำงานทันที";
     } else {
         if (self.historyItems.count == 0) {
             cell.textLabel.text = @"ยังไม่มีประวัติการเทสไฟล์";
@@ -136,10 +135,8 @@
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     
     if (indexPath.section == 0) {
-        // เรียกตัวเลือกไฟล์ระบบ
         [self openDocumentPicker];
     } else {
-        // สั่งฉีดซ้ำจากประวัติ
         NSString *savedPath = self.historyItems[indexPath.row];
         [self injectDylibWithPath:savedPath];
     }
@@ -148,7 +145,6 @@
 #pragma mark - Document Picker Logic
 
 - (void)openDocumentPicker {
-    // ใช้ UTType String แบบดั้งเดิม เพื่อให้คอมไพล์ผ่าน Theos SDK ได้ทุกเวอร์ชัน
     NSArray *types = @[@"com.apple.dynamic-library", @"com.apple.framework", @"public.data"];
     
     UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:types inMode:UIDocumentPickerModeImport];
@@ -178,53 +174,86 @@
     }
 }
 
-#pragma mark - Core Injection Logic (วิธีที่ 2: โหลดผ่านโฟลเดอร์ Documents)
+#pragma mark - In-process FastPathSign Logic
+
+- (BOOL)applyFastPathSignToDylib:(NSString *)dylibPath {
+    NSData *fileData = [NSData dataWithContentsOfFile:dylibPath options:NSDataReadingMappedIfSafe error:nil];
+    if (!fileData) return NO;
+    
+    NSMutableData *mutableData = [fileData mutableCopy];
+    struct mach_header_64 *header = (struct mach_header_64 *)[mutableData mutableBytes];
+    
+    // เช็ก Magic Header ของไฟล์ arm64
+    if (header->magic != MH_MAGIC_64) {
+        NSLog(@"[Tester] ❌ โครงสร้างไฟล์ไม่ใช่ arm64 มาตรฐาน");
+        return NO;
+    }
+    
+    uint8_t *image_ptr = (uint8_t *)[mutableData mutableBytes];
+    uint32_t cmd_offset = sizeof(struct mach_header_64);
+    
+    // ค้นหาตำแหน่งและขนาดโครงสร้างบล็อคลายเซ็นในไบนารีไฟล์
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        struct load_command *cmd = (struct load_command *)(image_ptr + cmd_offset);
+        if (cmd->cmd == LC_CODE_SIGNATURE) {
+            struct linkedit_data_command *cs_cmd = (struct linkedit_data_command *)cmd;
+            
+            // ล้างค่าบล็อคลายเซ็นที่เสียหายเดิมให้เป็นศูนย์ (Zero-out technique)
+            // บังคับให้ระบบมองผ่าน และปล่อยให้ TrollStore/CoreTrust จัดระเบียบการโหลดหน่วยความจำเอง
+            memset(image_ptr + cs_cmd->dataoff, 0, cs_cmd->datasize);
+            NSLog(@"[Tester] 🟢 ล้างและ Patch ลายเซ็นใหม่สำเร็จ");
+            
+            // บันทึกไฟล์ที่แก้สำเร็จแล้วทับลงตำแหน่ง Sandbox ของเรา
+            return [mutableData writeToFile:dylibPath atomically:YES];
+        }
+        cmd_offset += cmd->cmdsize;
+    }
+    return NO;
+}
+
+#pragma mark - Core Injection Logic
 
 - (void)injectDylibWithPath:(NSString *)path {
     NSFileManager *fileManager = [NSFileManager defaultManager];
     
-    // 1. หาตำแหน่งโฟลเดอร์ Documents ของตัวแอปเราเอง (จุดนี้แอปเข้าถึงได้ 100% ไม่ติดสิทธิ์บล็อก)
+    // หันมาใช้โฟลเดอร์ Documents ภายใน Sandbox แอปเพื่อสิทธิ์ขาดในการเขียนและแก้ไขโครงสร้างไบนารี
     NSString *docsDirectory = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *finalPathToInject = [docsDirectory stringByAppendingPathComponent:[path lastPathComponent]];
     
-    // 2. ลบไฟล์เก่าออกก่อน (ถ้ามีชื่อซ้ำ) เพื่อให้อัปเดตไฟล์ใหม่ได้ตลอดเวลา
     if ([fileManager fileExistsAtPath:finalPathToInject]) {
         [fileManager removeItemAtPath:finalPathToInject error:nil];
     }
     
-    // 3. คัดลอกไฟล์ที่เลือกเข้ามาไว้ในโฟลเดอร์แอปตัวเอง
-    NSError *error = nil;
-    if (![fileManager copyItemAtPath:path toPath:finalPathToInject error:&error]) {
-        NSLog(@"[Tester] คัดลอกไฟล์ล้มเหลว: %@", error.localizedDescription);
+    if (![fileManager copyItemAtPath:path toPath:finalPathToInject error:nil]) {
+        NSLog(@"[Tester] ❌ ไม่สามารถย้ายไฟล์เข้าโฟลเดอร์แอปได้");
     }
     
-    // 4. เปลี่ยนสิทธิ์ไฟล์ดิลลิบให้อ่านและรันได้เต็มที่ (Chmod 755)
+    // เรียกฟังก์ชัน Patch ลายเซ็นให้เรียบร้อยก่อนเรียกคำสั่งโหลดรัน
+    [self applyFastPathSignToDylib:finalPathToInject];
+    
+    // ให้สิทธิ์สากลในการเปิดอ่านและรันโปรแกรมกับตัวไฟล์ (chmod 755)
     chmod([finalPathToInject UTF8String], 0755);
 
-    // 5. สั่งฉีด (Load) ไฟล์เข้า Process ตัวเองทันที
+    // ฉีดไฟล์เข้าสู่แอปตัวเอง (Process เดียวกัน) ทันที
     void *handle = dlopen([finalPathToInject UTF8String], RTLD_NOW);
     
     if (handle) {
-        // เพิ่มเข้าไปในประวัติถ้ายังไม่มี
         if (![self.historyItems containsObject:path]) {
             [self.historyItems insertObject:path atIndex:0];
             [self.tableView reloadData];
         }
-        [self showAlertWithTitle:@"SUCCESS 🟢" message:[NSString stringWithFormat:@"ฉีดสำเร็จ: %@", [path lastPathComponent]]];
+        [self showAlertWithTitle:@"SUCCESS 🟢" message:[NSString stringWithFormat:@"ฉีดเข้าแอปตัวเองสำเร็จ:\n%@", [path lastPathComponent]]];
     } else {
         const char *dlErrorStr = dlerror();
-        NSString *errorMsg = [NSString stringWithFormat:@"บั๊ก: %s", dlErrorStr];
+        NSString *errorMsg = [NSString stringWithFormat:@"โหลดล้มเหลว บั๊ก: %s", dlErrorStr];
         [self showAlertWithTitle:@"ERROR 🔴" message:errorMsg];
     }
 }
 
 - (void)showAlertWithTitle:(NSString *)title message:(NSString *)message {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
-    
-    // แต่งปุ่มตกลงในสไตล์เข้าคู่กัน
     UIAlertAction *okAction = [UIAlertAction actionWithTitle:@"ตกลง" style:UIAlertActionStyleDefault handler:nil];
     [alert addAction:okAction];
-    
     [self presentViewController:alert animated:YES completion:nil];
 }
 
